@@ -48,7 +48,9 @@ def check_device(logger) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Lab 2: inferencia concurrente OpenVINO")
-    parser.add_argument("--reanudar", action="store_true", help="continuar el run interrumpido")
+    grupo = parser.add_mutually_exclusive_group()          # no permite usar los dos a la vez
+    grupo.add_argument("--reanudar", action="store_true", help="continuar el run interrumpido")
+    grupo.add_argument("--nuevo", action="store_true", help="iniciar un run nuevo")
     args = parser.parse_args()
 
     errors = config.validate_config()
@@ -72,7 +74,7 @@ def main() -> int:
     check_device(logger)
 
     from core.orchestrator import COMPLETED, Orchestrator
-    result = Orchestrator(config, budget, force_resume=args.reanudar).run()
+    result = Orchestrator(config, budget, force_resume=args.reanudar, force_new=args.nuevo).run()
     return EXIT_COMPLETED if result == COMPLETED else EXIT_INTERRUPTED
 
 

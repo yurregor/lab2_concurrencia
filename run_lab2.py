@@ -30,6 +30,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from core.status import find_resumable
 
 import config
 from core.exit_codes import EXIT_COMPLETED, EXIT_CONFIG_ERROR, EXIT_INTERRUPTED
@@ -39,7 +40,7 @@ IS_WINDOWS = os.name == "nt"
 STOP_CODES = {EXIT_COMPLETED: "todas las combinaciones terminaron",
               EXIT_CONFIG_ERROR: "error de configuracion",
               EXIT_INTERRUPTED: "detenido por el usuario"}
-CONFIRM_WORD = "si"          # palabra que hay que escribir para detener
+CONFIRM_WORD = "s"          # palabra que hay que escribir para detener
 POLL_S = 0.5                 # cada cuanto se revisa si main.py termino o hubo Ctrl+C
 
 
@@ -68,8 +69,7 @@ def confirm_stop(current: dict) -> bool:
     """
     try:
         answer = input(f"\n[supervisor] Ctrl+C recibido. La corrida SIGUE ejecutandose.\n"
-                       f"[supervisor] Escriba '{CONFIRM_WORD}' y Enter para DETENERLA; "
-                       f"cualquier otra cosa para continuar: ")
+                       f"[supervisor] DETENER ejecucion? (s/n) ")
     except (EOFError, OSError, KeyboardInterrupt):
         print()
         answer = ""
@@ -155,12 +155,30 @@ def sleep_or_confirm(seconds: float, current: dict) -> bool:
             return False
     return True
 
+def initial_args() -> list:
+    """Con RESUME_MODE="ask", la pregunta la hace el supervisor (esta en primer plano).
+
+    main.py corre en otro grupo de procesos y en Linux no puede leer del teclado:
+    si hiciera input(), el sistema lo pausaria (SIGTTIN).
+    """
+    if config.RESUME_MODE != "ask":
+        return []
+    previous = find_resumable(config.RESULTS_DIR)
+    if previous is None:
+        return []
+    try:
+        answer = input(f"Run interrumpido {previous.name}. Reanudar? (s/n): ")
+    except (EOFError, OSError):
+        answer = "s"
+    current_flag = "--reanudar" if answer.strip().lower() == "s" else "--nuevo"
+    log("Se reanuda el run anterior." if current_flag == "--reanudar" else "Se inicia un run NUEVO.")
+    return [current_flag]
 
 def main() -> int:
     current = {"proc": None, "detener": False, "ctrl_c": False}
     install_ctrl_c_flag(current)
     install_forwarding(current)
-    args: list[str] = []
+    args: list[str] = initial_args()
     while True:
         log(f"Lanzando main.py {' '.join(args)}")
         code, user_stop = run_child(args, current)

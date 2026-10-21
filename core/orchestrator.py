@@ -38,11 +38,12 @@ COMPLETED, INTERRUPTED = "completed", "interrupted"
 class Orchestrator:
     """Abre lo compartido (camara, monitor) una vez y recorre las combinaciones."""
 
-    def __init__(self, cfg, budget: ThreadBudget, force_resume: bool = False,
+    def __init__(self, cfg, budget: ThreadBudget, force_resume: bool = False, force_new: bool = False,
                  model_factory=None):
         self.cfg = cfg
         self.budget = budget
         self.force_resume = force_resume     # lo pide el supervisor al relanzar
+        self.force_new = force_new           # el supervisor ya pregunto y se eligio "n"
         # Permite inyectar un modelo falso en las pruebas (sin OpenVINO).
         self.model_factory = model_factory or (lambda info: OpenVinoModel(
             info, cfg, budget.hilos_por_modelo))
@@ -174,7 +175,7 @@ class Orchestrator:
     # ---------------- status y señales ----------------
     def _load_or_create_status(self) -> tuple[StatusManager, bool]:
         """Reanuda (supervisor o RESUME_MODE) o crea un run nuevo."""
-        mode = "auto" if self.force_resume else self.cfg.RESUME_MODE
+        mode = "auto" if self.force_resume else "never" if self.force_new else self.cfg.RESUME_MODE
         previous = None if mode == "never" else find_resumable(self.results_dir)
         if previous and mode == "ask":
             answer = input(f"Run interrumpido {previous.name}. Reanudar? (s/n): ").strip().lower()
