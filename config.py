@@ -113,7 +113,7 @@ COMBINATION_ORDER = ["det+pose", "det+seg", "pose+seg"]
 # reanuda, la combinacion continua solo con los minutos que le faltaban.
 DURACION_COMBINACION_MIN = 1440 #TODO: Modificar tiempo
 # "auto" -> si hay un run interrumpido, se reanuda.  "ask" -> pregunta.  "never" -> run nuevo.
-RESUME_MODE = "never"
+RESUME_MODE = "ask"
 # Segundos que espera run_lab2.py antes de relanzar main.py tras una caida.
 SUPERVISOR_ESPERA_TRAS_FALLO_S = 30
 

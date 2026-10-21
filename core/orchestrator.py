@@ -196,6 +196,7 @@ class Orchestrator:
         def handler(signum, _frame):
             events.emit("signal_received", senal=signal.Signals(signum).name)
             self.stop_event.set()
-        signal.signal(signal.SIGINT, handler)
-        if hasattr(signal, "SIGTERM"):
-            signal.signal(signal.SIGTERM, handler)
+            signal.signal(signal.SIGINT, handler)
+            for name in ("SIGTERM", "SIGBREAK"):      # SIGTERM: Linux | SIGBREAK: Windows
+                if hasattr(signal, name):
+                    signal.signal(getattr(signal, name), handler)

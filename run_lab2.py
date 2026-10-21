@@ -1,20 +1,30 @@
 """
 Supervisor del Laboratorio 2. Funciona en Windows y Linux. ESTE es el que se lanza.
 
-Para que existe: si main.py se cae por un error inesperado a mitad de los 3
-dias (falta de memoria, error de un driver, etc.), nadie estaria ahi para
-volver a lanzarlo. Este script lo relanza solo y main.py continua donde iba.
+Para que existe:
+1. Si main.py se cae por un error inesperado, lo relanza y continua donde iba.
+2. Ctrl+C NO detiene la corrida de inmediato: pregunta primero. main.py corre
+   en su propio grupo de procesos, asi que el Ctrl+C de la consola SOLO le
+   llega a este supervisor. Si se confirma, el supervisor le pide a main.py que
+   se detenga ordenadamente; si no, main.py nunca se entero y sigue igual.
+
+Como se atiende Ctrl+C: el manejador SOLO levanta una bandera (current["ctrl_c"]).
+El bucle principal la revisa cada 0.5 s y ahi hace la pregunta. No se usa
+KeyboardInterrupt porque en Windows puede saltar en cualquier linea (o no
+llegar mientras se espera al proceso hijo) y dejar al supervisor sin responder.
 
 Decide segun el codigo de salida de main.py (core/exit_codes.py):
     0  todas las combinaciones terminaron -> termina
     2  error de configuracion / sin GPU   -> termina (relanzar no lo arregla)
-    4  Ctrl+C del usuario                  -> termina
+    4  detenido por el usuario             -> termina
     otro (caida inesperada)                -> espera SUPERVISOR_ESPERA_TRAS_FALLO_S y relanza
 
 Uso:  python run_lab2.py
 Solo libreria estandar: no carga nada pesado.
 """
 import json
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -25,9 +35,12 @@ import config
 from core.exit_codes import EXIT_COMPLETED, EXIT_CONFIG_ERROR, EXIT_INTERRUPTED
 
 HERE = Path(__file__).resolve().parent
+IS_WINDOWS = os.name == "nt"
 STOP_CODES = {EXIT_COMPLETED: "todas las combinaciones terminaron",
               EXIT_CONFIG_ERROR: "error de configuracion",
               EXIT_INTERRUPTED: "detenido por el usuario"}
+CONFIRM_WORD = "si"          # palabra que hay que escribir para detener
+POLL_S = 0.5                 # cada cuanto se revisa si main.py termino o hubo Ctrl+C
 
 
 def log(message: str) -> None:
@@ -41,37 +54,123 @@ def record_restart(code: int) -> None:
         fh.write(json.dumps({"ts": datetime.now().isoformat(), "codigo_salida": code}) + "\n")
 
 
-def run_child(extra_args: list[str]) -> tuple[int, bool]:
-    """Ejecuta main.py y espera a que termine. Retorna (codigo, hubo_ctrl_c).
+def install_ctrl_c_flag(current: dict) -> None:
+    """Ctrl+C solo marca la bandera; la pregunta se hace en el bucle principal."""
+    def handler(_signum, _frame):
+        current["ctrl_c"] = True
+    signal.signal(signal.SIGINT, handler)
 
-    Ctrl+C llega a ambos procesos (misma consola). El hijo se detiene
-    ordenadamente; el supervisor solo anota que el usuario pidio parar y SIGUE
-    esperando. No se usa subprocess.call porque ante Ctrl+C mata al hijo.
+
+def confirm_stop(current: dict) -> bool:
+    """Pregunta si se quiere detener. Cualquier respuesta distinta de 'si' = continuar.
+
+    Ante la duda (no se puede leer la consola), la corrida sigue.
     """
-    proc = subprocess.Popen([sys.executable, str(HERE / "main.py"), *extra_args], cwd=HERE)
+    try:
+        answer = input(f"\n[supervisor] Ctrl+C recibido. La corrida SIGUE ejecutandose.\n"
+                       f"[supervisor] Escriba '{CONFIRM_WORD}' y Enter para DETENERLA; "
+                       f"cualquier otra cosa para continuar: ")
+    except (EOFError, OSError, KeyboardInterrupt):
+        print()
+        answer = ""
+    current["ctrl_c"] = False          # descarta Ctrl+C extra pulsados durante la pregunta
+    return answer.strip().lower() == CONFIRM_WORD
+
+
+def handle_ctrl_c(current: dict, proc: subprocess.Popen | None, user_stop: bool) -> bool:
+    """Atiende un Ctrl+C pendiente. Retorna el nuevo valor de user_stop."""
+    current["ctrl_c"] = False
+    if user_stop:
+        log("Ya se pidio detener; esperando el cierre ordenado...")
+        return True
+    if confirm_stop(current):
+        log("Deteniendo: main.py guarda resumenes y status (puede tardar unos segundos)...")
+        if proc is not None:
+            request_child_stop(proc)
+        return True
+    log("Continua la ejecucion normalmente (main.py nunca se detuvo).")
+    return False
+
+
+def start_child(extra_args: list[str]) -> subprocess.Popen:
+    """Lanza main.py en un grupo de procesos PROPIO (el Ctrl+C de la consola no le llega).
+
+      Linux  : process_group=0  (Python >= 3.11)
+      Windows: CREATE_NEW_PROCESS_GROUP
+    """
+    cmd = [sys.executable, str(HERE / "main.py"), *extra_args]
+    if IS_WINDOWS:
+        return subprocess.Popen(cmd, cwd=HERE, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+    return subprocess.Popen(cmd, cwd=HERE, process_group=0)
+
+
+def request_child_stop(proc: subprocess.Popen) -> None:
+    """Pide a main.py que se detenga ORDENADAMENTE (guarda resumenes y status).
+
+      Linux  : SIGTERM
+      Windows: CTRL_BREAK_EVENT -> llega como SIGBREAK a main.py
+    """
+    if proc.poll() is not None:
+        return
+    proc.send_signal(signal.CTRL_BREAK_EVENT if IS_WINDOWS else signal.SIGTERM)
+
+
+def run_child(extra_args: list[str], current: dict) -> tuple[int, bool]:
+    """Ejecuta main.py y espera a que termine. Retorna (codigo, detenido_por_usuario)."""
+    proc = start_child(extra_args)
+    current["proc"] = proc
     user_stop = False
     while True:
-        try:
-            return proc.wait(), user_stop
-        except KeyboardInterrupt:
-            user_stop = True
-            log("Ctrl+C recibido: esperando que main.py cierre ordenadamente...")
+        code = proc.poll()
+        if code is not None:
+            return code, user_stop or current["detener"]
+        if current["ctrl_c"]:
+            user_stop = handle_ctrl_c(current, proc, user_stop)
+        time.sleep(POLL_S)
+
+
+def install_forwarding(current: dict) -> None:
+    """SIGTERM/SIGHUP al supervisor (kill, tmux kill-session): detener main.py ordenadamente.
+
+    main.py esta en otro grupo y no lo recibiria solo. No se espera dentro del
+    manejador: el bucle principal ve la marca 'detener' y termina cuando main.py cierre.
+    """
+    def handler(_signum, _frame):
+        current["detener"] = True
+        proc = current["proc"]
+        if proc is None or proc.poll() is not None:
+            sys.exit(EXIT_INTERRUPTED)
+        request_child_stop(proc)
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), handler)
+
+
+def sleep_or_confirm(seconds: float, current: dict) -> bool:
+    """Espera antes de relanzar. Retorna False si el usuario confirma detener."""
+    end = time.time() + seconds
+    while time.time() < end:
+        time.sleep(min(POLL_S, max(0.0, end - time.time())))
+        if current["ctrl_c"] and handle_ctrl_c(current, None, False):
+            return False
+    return True
 
 
 def main() -> int:
+    current = {"proc": None, "detener": False, "ctrl_c": False}
+    install_ctrl_c_flag(current)
+    install_forwarding(current)
     args: list[str] = []
     while True:
         log(f"Lanzando main.py {' '.join(args)}")
-        code, user_stop = run_child(args)
+        code, user_stop = run_child(args, current)
         if user_stop or code in STOP_CODES:
-            log(f"Fin (codigo {code}: {STOP_CODES.get(code, 'Ctrl+C')}).")
+            log(f"Fin (codigo {code}: {STOP_CODES.get(code, 'detenido por el usuario')}).")
             return code if code == EXIT_CONFIG_ERROR else 0
         record_restart(code)
         log(f"main.py se cayo (codigo {code}). Relanzo en "
-            f"{config.SUPERVISOR_ESPERA_TRAS_FALLO_S} s y continua donde iba (Ctrl+C cancela).")
-        try:
-            time.sleep(config.SUPERVISOR_ESPERA_TRAS_FALLO_S)
-        except KeyboardInterrupt:
+            f"{config.SUPERVISOR_ESPERA_TRAS_FALLO_S} s y continua donde iba.")
+        if not sleep_or_confirm(config.SUPERVISOR_ESPERA_TRAS_FALLO_S, current):
             log("Cancelado por el usuario.")
             return 0
         args = ["--reanudar"]
